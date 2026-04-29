@@ -21,6 +21,7 @@ HTML = """
   <title>Weather Station</title>
   <link href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@300;400;600&family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
   <style>
     :root {
@@ -392,6 +393,7 @@ HTML = """
           borderColor: color,
           backgroundColor: color.replace(')', ',0.08)').replace('rgb', 'rgba'),
           borderWidth: 1.5,
+          spanGaps: false,
           fill: false,
           tension: 0.4,
           pointRadius: 0,
@@ -399,6 +401,18 @@ HTML = """
           pointHoverBorderWidth: 2,
           pointHoverBackgroundColor: '#080c12',
           pointHoverBorderColor: color,
+        },
+        {
+          // Gap connectors — dashed lines drawn only across data gaps
+          data: [],
+          spanGaps: false,
+          borderColor: color,
+          borderWidth: 1,
+          borderDash: [5, 7],
+          fill: false,
+          tension: 0,
+          pointRadius: 0,
+          pointHoverRadius: 0,
         }]
       },
       options: {
@@ -418,14 +432,31 @@ HTML = """
             padding: 12,
             displayColors: false,
             callbacks: {
-              title: items => items[0].label,
-              label: item => `${parseFloat(item.raw).toFixed(1)} ${unit}`
+              title: items => {
+                if (!items.length) return '';
+                return new Date(items[0].parsed.x)
+                  .toLocaleTimeString('en-CA', { hour12: false });
+              },
+              label: item => {
+                if (item.datasetIndex !== 0 || item.raw?.y === null) return null;
+                return `${parseFloat(item.raw.y).toFixed(1)} ${unit}`;
+              }
             }
           },
           annotation: { annotations: {} }
         },
         scales: {
           x: {
+            type: 'time',
+            time: {
+              displayFormats: {
+                millisecond: 'HH:mm:ss',
+                second:      'HH:mm:ss',
+                minute:      'HH:mm',
+                hour:        'HH:mm',
+                day:         'MMM d',
+              }
+            },
             ticks: { color:'#4a5568', font:{family:'Martian Mono',size:9}, maxTicksLimit:8 },
             grid:  { color:'#1c2535' }
           },
@@ -443,10 +474,10 @@ HTML = """
   const tempChart = makeChart('tempChart', '#f5a623', '°C');
   const humChart  = makeChart('humChart',  '#00c9ff', '% RH', { min: 0, max: 100 });
 
-  function setMinMaxAnnotations(chart, data, color) {
-    if (!data.length) return;
-    const min = Math.min(...data);
-    const max = Math.max(...data);
+  function setMinMaxAnnotations(chart, values) {
+    if (!values.length) return;
+    const min = Math.min(...values);
+    const max = Math.max(...values);
     chart.options.plugins.annotation.annotations = {
       maxLine: {
         type: 'line', yMin: max, yMax: max,
@@ -490,32 +521,78 @@ HTML = """
     });
   });
 
+  // ── Gap detection + series builder ─────────────────────────────────────────
+  // Returns {main, gaps} — both arrays of {x: Date, y: value|null}.
+  // main: solid line with null breaks at gap positions (time-proportional x).
+  // gaps: dashed connector segments drawn only across gap regions.
+  const GAP_FACTOR = 3;
+
+  function buildSeriesData(rows, field) {
+    if (!rows.length) return { main: [], gaps: [] };
+    if (rows.length === 1)
+      return { main: [{ x: new Date(rows[0].timestamp), y: rows[0][field] }], gaps: [] };
+
+    const intervals = [];
+    for (let i = 1; i < rows.length; i++)
+      intervals.push(new Date(rows[i].timestamp) - new Date(rows[i-1].timestamp));
+    intervals.sort((a, b) => a - b);
+    const threshold = intervals[Math.floor(intervals.length / 2)] * GAP_FACTOR;
+
+    const main = [];
+    const gaps = [];
+
+    main.push({ x: new Date(rows[0].timestamp), y: rows[0][field] });
+
+    for (let i = 1; i < rows.length; i++) {
+      const dt  = new Date(rows[i].timestamp);
+      const gap = dt - new Date(rows[i-1].timestamp);
+
+      if (gap > threshold) {
+        // Break the solid line at this timestamp
+        main.push({ x: dt, y: null });
+
+        // Dashed connector: last real point → next real point.
+        // Separate multiple gap segments with a null-y midpoint.
+        if (gaps.length > 0) {
+          const prev = gaps[gaps.length - 1];
+          const mid  = new Date((prev.x.getTime() + new Date(rows[i-1].timestamp).getTime()) / 2);
+          gaps.push({ x: mid, y: null });
+        }
+        gaps.push({ x: new Date(rows[i-1].timestamp), y: rows[i-1][field] });
+        gaps.push({ x: dt,                            y: rows[i][field]   });
+      }
+
+      main.push({ x: dt, y: rows[i][field] });
+    }
+
+    return { main, gaps };
+  }
+
   // ── Update loop ───────────────────────────────────────────────────────────
   async function update() {
     const res = await fetch('/data?window=' + currentWindow);
-    const d = await res.json();
-    if (!d.length) return;
+    const raw = await res.json();
+    if (!raw.length) return;
 
-    const latest = d[d.length - 1];
+    const latest = raw[raw.length - 1];
     setRollerValue(tempRoller, parseFloat(latest.temperature).toFixed(1));
     setRollerValue(humRoller,  parseFloat(latest.humidity).toFixed(1));
     setRollerValue(dpRoller,   parseFloat(latest.dew_point ?? 0).toFixed(1));
     setRollerValue(hiRoller,   parseFloat(latest.heat_index ?? 0).toFixed(1));
     document.getElementById('updated').textContent = 'last — ' + latest.timestamp.slice(11,19);
 
-    const labels  = d.map(r => r.timestamp.slice(11,19));
-    const temps   = d.map(r => r.temperature);
-    const hums    = d.map(r => r.humidity);
+    const tempSeries = buildSeriesData(raw, 'temperature');
+    const humSeries  = buildSeriesData(raw, 'humidity');
 
-    tempChart.data.labels = labels;
-    tempChart.data.datasets[0].data = temps;
+    tempChart.data.datasets[0].data = tempSeries.main;
+    tempChart.data.datasets[1].data = tempSeries.gaps;
     tempChart.update();
-    setMinMaxAnnotations(tempChart, temps, '#f5a623');
+    setMinMaxAnnotations(tempChart, tempSeries.main.filter(p => p.y !== null).map(p => p.y));
 
-    humChart.data.labels = labels;
-    humChart.data.datasets[0].data = hums;
+    humChart.data.datasets[0].data = humSeries.main;
+    humChart.data.datasets[1].data = humSeries.gaps;
     humChart.update();
-    setMinMaxAnnotations(humChart, hums, '#00c9ff');
+    setMinMaxAnnotations(humChart, humSeries.main.filter(p => p.y !== null).map(p => p.y));
   }
 
   update();
